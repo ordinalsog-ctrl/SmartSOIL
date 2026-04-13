@@ -158,6 +158,32 @@ void updateGameState(float moisture) {
 }
 
 // ═════════════════════════════════════════════════════════════
+// BATTERIE
+// ═════════════════════════════════════════════════════════════
+float readBatteryVolt() {
+#if PIN_BAT_ADC < 0
+    return -1.0f;  // Nicht verfügbar (Freenove)
+#else
+    analogReadResolution(12);
+    analogSetAttenuation(MY_ADC_ATTEN);
+    int raw = 0;
+    for (int i = 0; i < 10; i++) {
+        raw += analogRead(PIN_BAT_ADC);
+        delayMicroseconds(200);
+    }
+    raw /= 10;
+    float adcVolt  = (raw / 4095.0f) * BAT_ADC_VREF;
+    return adcVolt * BAT_DIVIDER_RATIO;
+#endif
+}
+
+int batteryPercent(float volt) {
+    if (volt < 0) return -1;
+    float pct = (volt - BAT_VOLT_EMPTY) / (BAT_VOLT_FULL - BAT_VOLT_EMPTY) * 100.0f;
+    return (int)constrain(pct, 0.0f, 100.0f);
+}
+
+// ═════════════════════════════════════════════════════════════
 // DISPLAY INIT
 // ═════════════════════════════════════════════════════════════
 bool initDisplay() {
@@ -178,8 +204,12 @@ void runSleepCycle() {
     int   raw      = readMedian();
     float moisture = rawToPercent(raw);
 
-    Serial.printf("[%s] %.1f%% (ADC:%d) Wake#%lu\n",
-                  DEVICE_ID, moisture, raw, rtcWakeCount);
+    // Batterie lesen
+    float batVolt  = readBatteryVolt();
+    int   batPct   = batteryPercent(batVolt);
+
+    Serial.printf("[%s] Feuchte: %.1f%% (ADC:%d) | Akku: %.2fV (%d%%) | Wake#%lu\n",
+                  DEVICE_ID, moisture, raw, batVolt, batPct, rtcWakeCount);
 
     // Gieß-Erkennung
     bool watered = false;
@@ -197,8 +227,15 @@ void runSleepCycle() {
     // Spielstand aktualisieren
     updateGameState(moisture);
 
-    // NeoPixel Statusfarbe
+    // NeoPixel Statusfarbe (Akku-Warnung überschreibt Pflanzenfarbe)
     PlantPersonality p = getPersonality(moisture);
+    if (batPct >= 0 && batPct <= BAT_WARN_PERCENT) {
+        // Akku kritisch: rot blinken
+        for (int i = 0; i < 3; i++) {
+            pixelSet(200, 0, 0); delay(200);
+            pixelOff();          delay(200);
+        }
+    }
     pixelFromPersonality(p);
 
     // OLED
@@ -208,6 +245,18 @@ void runSleepCycle() {
             delay(2500);
         }
         showReadingScreen(display, PLANT_NAME, moisture, p, rtcPlantLevel, rtcStreakDays);
+        // Batterieanzeige: letzte Zeile überschreiben wenn Warnung
+        if (batPct >= 0) {
+            display.setTextSize(1);
+            display.setTextColor(SSD1306_WHITE);
+            display.setCursor(0, 56);
+            if (batPct <= BAT_WARN_PERCENT) {
+                display.printf("! Akku: %d%%", batPct);
+            } else {
+                display.printf("Akku: %d%%", batPct);
+            }
+            display.display();
+        }
         delay(OLED_ON_SECONDS * 1000);
         display.clearDisplay();
         display.display();

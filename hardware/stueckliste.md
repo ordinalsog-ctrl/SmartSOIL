@@ -11,14 +11,15 @@
 | 2 | C2 | Kondensator | 10uF / 0603 | C19702 | SAMSUNG |
 | 3 | CN1 | JST Connector 2-Pin | B2B-PH-K-S-GW | C5251182 | JST |
 | 4 | LED1 | RGB LED | WS2812B-B/T | C2761795 | Worldsemi |
-| 5 | R1, R2 | Widerstand | 5.1kΩ / 0603 | C269716 | Tyohm |
-| 6 | SW1 | Taster | SKRKAEE020 | C115357 | ALPSALPINE |
-| 7 | U1 | ESP32-S3 Modul | ESP32-S3-WROOM-1-N4 | C2913197 | ESPRESSIF |
-| 8 | U2 | LiPo Ladecontroller | TP4056-42-ESOP8 | C16581 | TOPPOWER |
-| 9 | U3 | LDO Regler 3.3V | AMS1117-3.3 | C6186 | AMS |
-| 10 | U4 | JST Connector 4-Pin | B4B-PH-K-S-GW | C566011 | JST |
-| 11 | U5 | JST Connector 3-Pin | B3B-PH-KL(LF)(SN) | C158004 | JST |
-| 12 | USBC1 | USB-C Buchse | TYPE-C-31-M-12 | C165948 | KH |
+| 5 | R1, R2 | Widerstand | 5.1kΩ / 0603 | C23186 | UNI-ROYAL |
+| 6 | R3, R4 | Spannungsteiler Akku | 100kΩ / 0603 | C25803 | UNI-ROYAL |
+| 7 | SW1 | Taster | SKRKAEE020 | C115357 | ALPSALPINE |
+| 8 | U1 | ESP32-S3 Modul | ESP32-S3-WROOM-1-N4 | C2913197 | ESPRESSIF |
+| 9 | U2 | LiPo Ladecontroller | TP4056-42-ESOP8 | C16581 | TOPPOWER |
+| 10 | U3 | LDO Regler 3.3V | AMS1117-3.3 | C6186 | AMS |
+| 11 | U4 | JST Connector 4-Pin | B4B-PH-K-S-GW | C566011 | JST |
+| 12 | U5 | JST Connector 3-Pin | B3B-PH-KL(LF)(SN) | C158004 | JST |
+| 13 | USBC1 | USB-C Buchse | TYPE-C-31-M-12 | C165948 | KH |
 
 **PCB Spezifikationen:**
 - Board-Größe: 55 × 42 mm
@@ -45,6 +46,7 @@
 | GPIO | Funktion | Bauteil |
 |------|----------|---------|
 | GPIO 0 | Button (BOOT) | SW1 |
+| GPIO 3 | ADC – Batteriespannung (via R3/R4 Teiler) | R3/R4 Mittelpunkt |
 | GPIO 4 | ADC – Feuchtigkeitssensor | U5 Pin 3 |
 | GPIO 8 | I2C SDA – OLED | U4 Pin 2 |
 | GPIO 9 | I2C SCL – OLED | U4 Pin 3 |

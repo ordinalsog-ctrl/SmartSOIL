@@ -18,13 +18,15 @@
   #define PIN_SCL               22       // I2C SCL
   #define PIN_LED_BUILTIN        2       // Onboard LED (kein WS2812)
   #define HAS_NEOPIXEL           0
+  #define PIN_BAT_ADC           -1       // Kein Spannungsteiler auf Freenove
 #else
-  // WaveShare ESP32-S3 Zero (Produkt)
+  // Custom PCB SmartSoil v1.0
   #define SENSOR_PIN             4       // ADC1 – GPIO4
   #define PIN_SDA                8       // I2C SDA
   #define PIN_SCL                9       // I2C SCL
-  #define PIN_LED_WS2812        21       // Onboard WS2812 RGB LED
+  #define PIN_LED_WS2812        21       // WS2812B RGB LED
   #define HAS_NEOPIXEL           1
+  #define PIN_BAT_ADC            3       // ADC – Batterie (R3/R4 Spannungsteiler)
 #endif
 #define PIN_BUTTON               0       // BOOT-Taste (GPIO0) – beide Boards
 
@@ -68,6 +70,15 @@
 #define EEPROM_MAGIC_BYTE       0xA7
 #define EEPROM_ADDR_MAGIC       0
 #define EEPROM_CAL_BASE         4
+
+// ── Batterie ──────────────────────────────────────────────────
+// Spannungsteiler R3/R4: je 100kΩ → ADC misst halbe Akkuspannung
+// Akku: 3.0V (leer) bis 4.2V (voll) → ADC: 1.5V bis 2.1V
+#define BAT_VOLT_FULL           4.2f     // Volt bei 100%
+#define BAT_VOLT_EMPTY          3.0f     // Volt bei 0%
+#define BAT_DIVIDER_RATIO       2.0f     // R3=R4=100kΩ → Teiler = /2
+#define BAT_ADC_VREF            3.3f     // ESP32-S3 Referenzspannung
+#define BAT_WARN_PERCENT        20       // % Warnschwelle (LED rot blinkt)
 
 // ── Gamification ──────────────────────────────────────────────
 #define LEVEL_UP_STREAK_DAYS    7        // Streak-Tage für Level-Up

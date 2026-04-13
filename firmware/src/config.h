@@ -1,65 +1,75 @@
+/**
+ * SmartSoil – Konfiguration
+ * WaveShare ESP32-S3 Zero
+ */
+
 #ifndef CONFIG_H
 #define CONFIG_H
 
-// --- Pin-Belegung ---
-#define PIN_MOISTURE        34    // Kapazitiver Feuchtesensor (ADC1_CH6)
-#define PIN_PH              35    // pH-Sensor (ADC1_CH7)
-#define PIN_BATTERY         32    // Batteriespannung über Spannungsteiler (ADC1_CH4)
-#define PIN_SDA             21    // OLED I2C Data
-#define PIN_SCL             22    // OLED I2C Clock
-#define PIN_BUTTON          27    // Taster für Kalibrierung/Modus
-#define PIN_LED             2     // Onboard LED (Status)
+// ── Gerät ────────────────────────────────────────────────────
+#define DEVICE_ID               "sensor_01"
+#define PLANT_NAME              "Monstera"       // Anzeigename auf OLED + Dashboard
 
-// --- OLED Display ---
-#define SCREEN_WIDTH        128
-#define SCREEN_HEIGHT       64
-#define OLED_ADDR           0x3C
-
-// --- Kalibrierung Feuchtesensor ---
-#define MOISTURE_DRY        3500  // ADC-Wert bei trockener Erde
-#define MOISTURE_WET        1500  // ADC-Wert bei nasser Erde
-#define MOISTURE_SAMPLES    20    // Anzahl Messungen für Mittelwert
-
-// --- Kalibrierung pH-Sensor ---
-#define PH_SAMPLES          20    // Anzahl Messungen für Mittelwert
-#define PH_CAL_DEFAULT_4    1.98  // Erwartete Spannung bei pH 4.0 Puffer
-#define PH_CAL_DEFAULT_7    2.50  // Erwartete Spannung bei pH 7.0 Puffer
-
-// --- Schwellenwerte Feuchte ---
-#define MOISTURE_THRESHOLD_LOW    30   // Unter 30% -> "Gießen!"
-#define MOISTURE_THRESHOLD_HIGH   70   // Über 70% -> "Zu nass!"
-
-// --- Schwellenwerte pH ---
-#define PH_OPTIMAL_LOW      6.0
-#define PH_OPTIMAL_HIGH     7.0
-#define PH_WARN_LOW         5.5
-#define PH_WARN_HIGH        7.5
-
-// --- Batterie ---
-// Spannungsteiler: 100kΩ + 100kΩ -> Faktor 2
-#define BATTERY_DIVIDER     2.0
-#define BATTERY_FULL        4.2   // LiPo voll
-#define BATTERY_EMPTY       3.3   // LiPo leer
-#define BATTERY_LOW_WARN    3.5   // Warnung ab hier
-
-// --- Timing ---
-#define MEASURE_INTERVAL_MS     5000    // Alle 5 Sekunden messen
-#define DISPLAY_TIMEOUT_MS      30000   // Display aus nach 30s Inaktivität
-#define LONG_PRESS_MS           3000    // Langer Tastendruck für Kalibrierung
-#define DEBOUNCE_MS             50      // Taster-Entprellung
-
-// --- WiFi ---
-#define WIFI_AP_SSID        "SmartSoil"
-#define WIFI_AP_PASS        "smartsoil123"
-#define WEBSERVER_PORT      80
-
-// --- EEPROM ---
-#define EEPROM_SIZE         64
-#define EEPROM_MAGIC        0x55    // Prüfbyte ob kalibriert
-#define EEPROM_ADDR_MAGIC   0
-#define EEPROM_ADDR_PH_4V   4       // float: Spannung bei pH 4
-#define EEPROM_ADDR_PH_7V   8       // float: Spannung bei pH 7
-#define EEPROM_ADDR_MOIST_D 12      // int: ADC trocken
-#define EEPROM_ADDR_MOIST_W 16      // int: ADC nass
-
+// ── Pins ──────────────────────────────────────────────────────
+#ifdef FREENOVE_BOARD
+  // Freenove ESP32-Wrover (Prototyp)
+  #define SENSOR_PIN            34       // ADC1 – GPIO34
+  #define PIN_SDA               21       // I2C SDA
+  #define PIN_SCL               22       // I2C SCL
+  #define PIN_LED_BUILTIN        2       // Onboard LED (kein WS2812)
+  #define HAS_NEOPIXEL           0
+#else
+  // WaveShare ESP32-S3 Zero (Produkt)
+  #define SENSOR_PIN             4       // ADC1 – GPIO4
+  #define PIN_SDA                8       // I2C SDA
+  #define PIN_SCL                9       // I2C SCL
+  #define PIN_LED_WS2812        21       // Onboard WS2812 RGB LED
+  #define HAS_NEOPIXEL           1
 #endif
+#define PIN_BUTTON               0       // BOOT-Taste (GPIO0) – beide Boards
+
+// ── ADC Attenuation ───────────────────────────────────────────
+// ADC_ATTENDB_MAX = höchste Dämpfung (11dB / 3.3V Bereich)
+// funktioniert auf ESP32 classic und ESP32-S3
+#define MY_ADC_ATTEN  ADC_ATTENDB_MAX
+
+// ── Sensor / Kalibrierung ─────────────────────────────────────
+#define SAMPLES_PER_READING     30
+#define CAL_DRY_DEFAULT         3200
+#define CAL_WET_DEFAULT         1100
+
+// ── Schwellenwerte (%) ────────────────────────────────────────
+#define THRESH_CRITICAL_DRY     15
+#define THRESH_DRY              30
+#define THRESH_OK_HIGH          65
+#define THRESH_WET              80
+
+// ── Gieß-Erkennung ────────────────────────────────────────────
+#define WATERING_DELTA          12.0f    // % Anstieg = Gießen erkannt
+
+// ── Deep Sleep ────────────────────────────────────────────────
+#define SLEEP_MINUTES           30
+#define OLED_ON_SECONDS         4        // Anzeigedauer nach Timer-Wake
+
+// ── WiFi ──────────────────────────────────────────────────────
+// WIFI_SSID und WIFI_PASS in firmware/src/config_secrets.h eintragen
+// (Vorlage: config_secrets.h.example)
+#include "config_secrets.h"
+#define WIFI_TIMEOUT_SEC        15
+#define WIFI_ACTIVE_TIMEOUT_MIN 15       // Auto-Sleep nach Inaktivität
+
+// ── OLED ──────────────────────────────────────────────────────
+#define OLED_ADDR               0x3C
+#define OLED_WIDTH              128
+#define OLED_HEIGHT             64
+
+// ── EEPROM (Kalibrierung) ─────────────────────────────────────
+#define EEPROM_SIZE             64
+#define EEPROM_MAGIC_BYTE       0xA7
+#define EEPROM_ADDR_MAGIC       0
+#define EEPROM_CAL_BASE         4
+
+// ── Gamification ──────────────────────────────────────────────
+#define LEVEL_UP_STREAK_DAYS    7        // Streak-Tage für Level-Up
+
+#endif // CONFIG_H

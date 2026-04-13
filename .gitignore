@@ -1,0 +1,22 @@
+# System
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# Secrets (niemals committen!)
+firmware/src/config_secrets.h
+
+# PlatformIO
+firmware/.pio/
+firmware/.pioenvs/
+firmware/.piolibdeps/
+
+# Backups
+*.bak
+
+# VSCode (nur lokale Einstellungen)
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/.browse.c_cpp.db*
+.vscode/ipch/

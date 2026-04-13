@@ -1,192 +1,371 @@
+/**
+ * SmartSoil – Haupt-Firmware
+ *
+ * Modus 1 (Timer-Wake): Sensor lesen → OLED 4s → schlafen
+ * Modus 2 (Button-Wake): WiFi an → Dashboard im Browser → Auto-Sleep nach 15min
+ *
+ * Board: WaveShare ESP32-S3 Zero
+ */
+
 #include <Arduino.h>
+#include "config.h"    // ← muss zuerst kommen (defines HAS_NEOPIXEL, MY_ADC_ATTEN)
+
+#include <WiFi.h>
+#include <EEPROM.h>
+#include <LittleFS.h>
 #include <Wire.h>
-#include "config.h"
-#include "sensors.h"
-#include "display.h"
-#include "webserver.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WebServer.h>
+#include <time.h>
+#if HAS_NEOPIXEL
+  #include <Adafruit_NeoPixel.h>
+#endif
+#include "plant.h"
+#include "storage.h"
+#include "display_mgr.h"
+#include "dashboard.h"
 
-// Module
-Sensors sensors;
-Display ui;
-SmartSoilWeb web;
+// ── RTC Memory (überlebt Deep Sleep) ─────────────────────────
+RTC_DATA_ATTR float    rtcLastMoisture  = -1.0f;  // -1 = noch keine Messung
+RTC_DATA_ATTR uint32_t rtcWakeCount     = 0;
+RTC_DATA_ATTR uint32_t rtcLastWaterTime = 0;
+RTC_DATA_ATTR int      rtcStreakDays    = 0;
+RTC_DATA_ATTR uint32_t rtcLastStreakDay = 0;
+RTC_DATA_ATTR int      rtcPlantLevel   = 1;
+RTC_DATA_ATTR uint32_t rtcApproxTime   = 0;       // Unix-Timestamp (via NTP gesetzt)
 
-// Zustand
-enum Mode { MODE_MAIN, MODE_CAL_PH, MODE_CAL_MOISTURE };
-Mode currentMode = MODE_MAIN;
-int calStep = 0;
+// ── Globale Instanzen ─────────────────────────────────────────
+Adafruit_SSD1306  display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+WebServer         server(80);
+int               calDry = CAL_DRY_DEFAULT;
+int               calWet = CAL_WET_DEFAULT;
+#if HAS_NEOPIXEL
+  Adafruit_NeoPixel pixel(1, PIN_LED_WS2812, NEO_GRB + NEO_KHZ800);
+#endif
 
-SensorData currentData;
-unsigned long lastMeasure = 0;
+// ═════════════════════════════════════════════════════════════
+// KALIBRIERUNG
+// ═════════════════════════════════════════════════════════════
+void loadCalibration() {
+    EEPROM.begin(EEPROM_SIZE);
+    if (EEPROM.read(EEPROM_ADDR_MAGIC) == EEPROM_MAGIC_BYTE) {
+        EEPROM.get(EEPROM_CAL_BASE,     calDry);
+        EEPROM.get(EEPROM_CAL_BASE + 4, calWet);
+        if (calDry < 1000 || calDry > 4095) calDry = CAL_DRY_DEFAULT;
+        if (calWet  < 100  || calWet  > 3000) calWet = CAL_WET_DEFAULT;
+    }
+    EEPROM.end();
+}
 
-// Taster-Handling
-bool buttonPressed = false;
-unsigned long buttonDownTime = 0;
+// ═════════════════════════════════════════════════════════════
+// SENSOR
+// ═════════════════════════════════════════════════════════════
+int readMedian() {
+    const int n = SAMPLES_PER_READING;
+    int vals[n];
+    for (int i = 0; i < n; i++) {
+        vals[i] = analogRead(SENSOR_PIN);
+        delayMicroseconds(500);
+    }
+    // Insertion Sort
+    for (int i = 1; i < n; i++) {
+        int key = vals[i], j = i - 1;
+        while (j >= 0 && vals[j] > key) { vals[j + 1] = vals[j]; j--; }
+        vals[j + 1] = key;
+    }
+    return vals[n / 2];
+}
 
-// --- Taster ---
+float rawToPercent(int raw) {
+    float pct = (float)(calDry - raw) / (float)(calDry - calWet) * 100.0f;
+    return constrain(pct, 0.0f, 100.0f);
+}
 
-void onShortPress() {
-    ui.wake();
-    ui.lastActivity = millis();
+// ═════════════════════════════════════════════════════════════
+// ZEIT
+// ═════════════════════════════════════════════════════════════
+uint32_t getApproxTime() {
+    // Wenn NTP-Zeit bekannt: hochrechnen via Sleep-Zyklen
+    if (rtcApproxTime > 0) {
+        return rtcApproxTime + (rtcWakeCount * (uint32_t)SLEEP_MINUTES * 60);
+    }
+    return 0;
+}
 
-    if (currentMode == MODE_CAL_PH) {
-        float v = sensors.readPHVoltage();
-        if (calStep == 0) {
-            sensors.calibratePH7(v);
-            Serial.printf("pH 7.0 kalibriert: %.3fV\n", v);
-            calStep = 1;
-        } else {
-            sensors.calibratePH4(v);
-            Serial.printf("pH 4.0 kalibriert: %.3fV\n", v);
-            sensors.saveCalibration();
-            ui.showMessage("pH Kalibrierung", "gespeichert!");
-            delay(2000);
-            currentMode = MODE_CAL_MOISTURE;
-            calStep = 0;
+bool syncNTP() {
+    configTime(3600, 3600, "pool.ntp.org", "time.nist.gov");  // UTC+1 + Sommerzeit
+    struct tm ti;
+    if (!getLocalTime(&ti, 6000)) return false;
+    rtcApproxTime = mktime(&ti) - (rtcWakeCount * (uint32_t)SLEEP_MINUTES * 60);
+    return true;
+}
+
+// ═════════════════════════════════════════════════════════════
+// LED STATUS
+// ═════════════════════════════════════════════════════════════
+void pixelSet(uint8_t r, uint8_t g, uint8_t b) {
+#if HAS_NEOPIXEL
+    pixel.begin();
+    pixel.setBrightness(40);
+    pixel.setPixelColor(0, pixel.Color(r, g, b));
+    pixel.show();
+#else
+    // Freenove: einfache LED — an wenn irgendeine Farbe
+    pinMode(PIN_LED_BUILTIN, OUTPUT);
+    digitalWrite(PIN_LED_BUILTIN, (r || g || b) ? HIGH : LOW);
+#endif
+}
+
+void pixelOff() {
+#if HAS_NEOPIXEL
+    pixel.begin();
+    pixel.setPixelColor(0, 0);
+    pixel.show();
+#else
+    pinMode(PIN_LED_BUILTIN, OUTPUT);
+    digitalWrite(PIN_LED_BUILTIN, LOW);
+#endif
+}
+
+void pixelFromPersonality(const PlantPersonality& p) {
+    pixelSet(p.r, p.g, p.b);
+}
+
+// ═════════════════════════════════════════════════════════════
+// GAMIFICATION
+// ═════════════════════════════════════════════════════════════
+void updateGameState(float moisture) {
+    uint32_t now = getApproxTime();
+    if (now == 0) return;
+
+    uint32_t todayDay = now / 86400;
+
+    bool optimal = (moisture >= THRESH_CRITICAL_DRY && moisture < THRESH_WET);
+
+    if (todayDay > rtcLastStreakDay) {
+        rtcLastStreakDay = todayDay;
+        if (optimal) {
+            rtcStreakDays++;
+        } else if (moisture < THRESH_CRITICAL_DRY) {
+            rtcStreakDays = 0;  // Streak bricht nur bei kritisch trocken ab
         }
-    } else if (currentMode == MODE_CAL_MOISTURE) {
-        int raw = sensors.readMoistureRaw();
-        if (calStep == 0) {
-            sensors.calibrateMoistureDry(raw);
-            Serial.printf("Trocken kalibriert: %d\n", raw);
-            calStep = 1;
-        } else {
-            sensors.calibrateMoistureWet(raw);
-            Serial.printf("Nass kalibriert: %d\n", raw);
-            sensors.saveCalibration();
-            ui.showMessage("Feuchte Kalibrierung", "gespeichert!");
-            delay(2000);
-            currentMode = MODE_MAIN;
-            calStep = 0;
+        // Level steigt alle LEVEL_UP_STREAK_DAYS Streak-Tage, max Level 10
+        if (rtcStreakDays > 0 && rtcStreakDays % LEVEL_UP_STREAK_DAYS == 0) {
+            if (rtcPlantLevel < 10) rtcPlantLevel++;
         }
     }
 }
 
-void onLongPress() {
-    if (currentMode == MODE_MAIN) {
-        // Kalibrierung starten
-        currentMode = MODE_CAL_PH;
-        calStep = 0;
-        Serial.println("Kalibrierungsmodus gestartet");
-    } else {
-        // Kalibrierung abbrechen
-        currentMode = MODE_MAIN;
-        calStep = 0;
-        ui.showMessage("Kalibrierung", "abgebrochen");
-        delay(1500);
-    }
+// ═════════════════════════════════════════════════════════════
+// DISPLAY INIT
+// ═════════════════════════════════════════════════════════════
+bool initDisplay() {
+    Wire.begin(PIN_SDA, PIN_SCL);
+    return display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
 }
 
-void handleButton() {
-    bool pressed = (digitalRead(PIN_BUTTON) == LOW);
+// ═════════════════════════════════════════════════════════════
+// MODUS 1: SLEEP-ZYKLUS
+// ═════════════════════════════════════════════════════════════
+void runSleepCycle() {
+    rtcWakeCount++;
 
-    if (pressed && !buttonPressed) {
-        buttonPressed = true;
-        buttonDownTime = millis();
-    }
+    // Sensor lesen
+    loadCalibration();
+    analogReadResolution(12);
+    analogSetAttenuation(MY_ADC_ATTEN);
+    int   raw      = readMedian();
+    float moisture = rawToPercent(raw);
 
-    if (!pressed && buttonPressed) {
-        buttonPressed = false;
-        unsigned long duration = millis() - buttonDownTime;
+    Serial.printf("[%s] %.1f%% (ADC:%d) Wake#%lu\n",
+                  DEVICE_ID, moisture, raw, rtcWakeCount);
 
-        if (duration > DEBOUNCE_MS && duration < LONG_PRESS_MS) {
-            onShortPress();
-        } else if (duration >= LONG_PRESS_MS) {
-            onLongPress();
+    // Gieß-Erkennung
+    bool watered = false;
+    float prevMoisture = rtcLastMoisture;
+
+    if (rtcLastMoisture >= 0.0f) {
+        float delta = moisture - rtcLastMoisture;
+        if (delta >= WATERING_DELTA) {
+            watered = true;
+            rtcLastWaterTime = getApproxTime();
+            Serial.printf("[Giessen] %.1f%% -> %.1f%%\n", prevMoisture, moisture);
         }
     }
 
-    // LED blinken bei langem Druck als Feedback
-    if (buttonPressed && (millis() - buttonDownTime > LONG_PRESS_MS)) {
-        digitalWrite(PIN_LED, (millis() / 200) % 2);
+    // Spielstand aktualisieren
+    updateGameState(moisture);
+
+    // NeoPixel Statusfarbe
+    PlantPersonality p = getPersonality(moisture);
+    pixelFromPersonality(p);
+
+    // OLED
+    if (initDisplay()) {
+        if (watered) {
+            showWateringScreen(display, prevMoisture, moisture);
+            delay(2500);
+        }
+        showReadingScreen(display, PLANT_NAME, moisture, p, rtcPlantLevel, rtcStreakDays);
+        delay(OLED_ON_SECONDS * 1000);
+        display.clearDisplay();
+        display.display();
+        display.ssd1306_command(SSD1306_DISPLAYOFF);  // Display aus = Strom sparen
     }
+
+    // In LittleFS speichern
+    if (LittleFS.begin(true)) {
+        uint32_t now = getApproxTime();
+        appendReading(now, moisture, raw, watered);
+        if (watered) logWateringEvent(now, prevMoisture, moisture);
+        trimReadingsIfNeeded();
+        LittleFS.end();
+    }
+
+    // RTC Memory aktualisieren
+    rtcLastMoisture = moisture;
+
+    pixelOff();
+    Serial.printf("[Sleep] %d Minuten\n", SLEEP_MINUTES);
+    Serial.flush();
+
+    // Sleep: Timer + Button als Wakeup-Quellen
+    esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_MINUTES * 60ULL * 1000000ULL);
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_BUTTON, LOW);
+    esp_deep_sleep_start();
 }
 
-// --- Setup ---
+// ═════════════════════════════════════════════════════════════
+// MODUS 2: WIFI AKTIV
+// ═════════════════════════════════════════════════════════════
+void runWiFiMode() {
+    Serial.println("[WiFi] Modus gestartet");
 
+    // OLED: Verbindet...
+    if (initDisplay()) showConnectingScreen(display);
+
+    // NeoPixel: Blau = verbindet
+    pixelSet(0, 0, 100);
+
+    // WiFi verbinden
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+    bool connected = false;
+    for (int i = 0; i < WIFI_TIMEOUT_SEC * 2; i++) {
+        if (WiFi.status() == WL_CONNECTED) { connected = true; break; }
+        delay(500);
+    }
+
+    if (!connected) {
+        Serial.println("[WiFi] Verbindung fehlgeschlagen");
+        if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+            showWiFiErrorScreen(display);
+        }
+        pixelSet(200, 0, 0);
+        delay(3000);
+        goto sleep;
+    }
+
+    {
+        // NTP synchronisieren
+        if (syncNTP()) {
+            Serial.println("[NTP] Synchronisiert");
+        }
+
+        // Sensor lesen
+        loadCalibration();
+        analogReadResolution(12);
+        analogSetAttenuation(MY_ADC_ATTEN);
+
+        // Einmalige Messung für OLED + NeoPixel-Farbe beim Start
+        int   raw      = readMedian();
+        float moisture = rawToPercent(raw);
+        PlantPersonality p = getPersonality(moisture);
+        rtcLastMoisture = moisture;
+
+        pixelFromPersonality(p);
+
+        // OLED: IP-Adresse anzeigen
+        String ip = WiFi.localIP().toString();
+        if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+            showWiFiActiveScreen(display, ip, moisture);
+        }
+
+        Serial.printf("[WiFi] IP: %s\n", ip.c_str());
+
+        // LittleFS für Web-Handler
+        LittleFS.begin(true);
+
+        // Web-Dashboard starten (Live-Sensor via Funktionszeiger)
+        setupDashboardRoutes(server, readMedian, rawToPercent,
+                             rtcLastWaterTime, rtcStreakDays, rtcPlantLevel);
+        server.begin();
+
+        // Event-Loop: läuft bis Timeout oder erneuter Knopfdruck
+        uint32_t startMs  = millis();
+        uint32_t timeoutMs = (uint32_t)WIFI_ACTIVE_TIMEOUT_MIN * 60UL * 1000UL;
+        bool     btnWasHigh = true;
+
+        while (millis() - startMs < timeoutMs) {
+            server.handleClient();
+
+            // Button: erneuter Druck → sofort schlafen
+            bool btnNow = (digitalRead(PIN_BUTTON) == HIGH);
+            if (btnWasHigh && !btnNow) {
+                delay(50);
+                if (digitalRead(PIN_BUTTON) == LOW) {
+                    Serial.println("[WiFi] Knopf gedrückt → schlafen");
+                    break;
+                }
+            }
+            btnWasHigh = btnNow;
+            delay(5);
+        }
+
+        server.stop();
+        LittleFS.end();
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+
+        if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+            display.clearDisplay();
+            display.display();
+            display.ssd1306_command(SSD1306_DISPLAYOFF);
+        }
+    }
+
+sleep:
+    pixelOff();
+    Serial.printf("[Sleep] %d Minuten\n", SLEEP_MINUTES);
+    Serial.flush();
+
+    esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_MINUTES * 60ULL * 1000000ULL);
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_BUTTON, LOW);
+    esp_deep_sleep_start();
+}
+
+// ═════════════════════════════════════════════════════════════
+// SETUP – läuft nach jedem Aufwachen
+// ═════════════════════════════════════════════════════════════
 void setup() {
     Serial.begin(115200);
-    Serial.println();
-    Serial.println("=========================");
-    Serial.println("  SmartSoil Prototyp v1  ");
-    Serial.println("=========================");
-
     pinMode(PIN_BUTTON, INPUT_PULLUP);
-    pinMode(PIN_LED, OUTPUT);
-    digitalWrite(PIN_LED, LOW);
 
-    // Sensoren initialisieren
-    sensors.begin();
-    Serial.println("[OK] Sensoren");
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
 
-    // Display starten
-    Wire.begin(PIN_SDA, PIN_SCL);
-    if (!ui.begin()) {
-        Serial.println("[FEHLER] OLED nicht gefunden!");
-        while (true) {
-            digitalWrite(PIN_LED, !digitalRead(PIN_LED));
-            delay(500);
-        }
+    Serial.printf("\n[Boot] Wakeup: %d\n", (int)cause);
+
+    if (cause == ESP_SLEEP_WAKEUP_EXT0) {
+        // Button gedrückt → WiFi-Modus
+        runWiFiMode();
+    } else {
+        // Timer-Wake oder erster Boot → normaler Mess-Zyklus
+        runSleepCycle();
     }
-    Serial.println("[OK] Display");
-
-    // WiFi Access Point + Webserver
-    web.begin();
-    Serial.println("[OK] WiFi AP + Webserver");
-
-    Serial.println();
-    Serial.printf("SSID: %s / Passwort: %s\n", WIFI_AP_SSID, WIFI_AP_PASS);
-    Serial.printf("Webinterface: http://%s\n", WiFi.softAPIP().toString().c_str());
-    Serial.println();
-    Serial.println("Taster: kurz = Aktion | lang (3s) = Kalibrierung");
-    Serial.println("-------------------------------------------------");
-
-    delay(2000);
 }
 
-// --- Loop ---
-
 void loop() {
-    handleButton();
-
-    unsigned long now = millis();
-
-    // Messung
-    if (now - lastMeasure >= MEASURE_INTERVAL_MS) {
-        lastMeasure = now;
-        currentData = sensors.read();
-
-        // Serial-Ausgabe
-        Serial.printf("Feuchte: %5.1f%% (raw: %.0f) | pH: %4.1f (%.3fV) | Akku: %d%% (%.2fV)\n",
-                       currentData.moisturePercent, currentData.moistureRaw,
-                       currentData.phValue, currentData.phVoltage,
-                       currentData.batteryPercent, currentData.batteryVoltage);
-
-        // Display aktualisieren
-        if (currentMode == MODE_MAIN) {
-            ui.showMain(currentData);
-        } else if (currentMode == MODE_CAL_PH) {
-            ui.showCalibrationPH(calStep, sensors.readPHVoltage());
-        } else if (currentMode == MODE_CAL_MOISTURE) {
-            ui.showCalibrationMoisture(calStep, sensors.readMoistureRaw());
-        }
-
-        // Webserver aktualisieren
-        web.update(currentData);
-
-        // Batterie-Warnung
-        if (currentData.batteryVoltage < BATTERY_LOW_WARN && currentData.batteryVoltage > 1.0) {
-            digitalWrite(PIN_LED, (millis() / 1000) % 2);
-        }
-    }
-
-    // Webserver-Requests bearbeiten
-    if (web.running) web.server.handleClient();
-
-    // Display-Timeout
-    if (ui.shouldSleep()) {
-        ui.sleep();
-        Serial.println("Display aus (Timeout). Taste druecken zum Aufwecken.");
-    }
-
-    delay(10);
+    // Wird nie erreicht — ESP32 schläft nach setup()
 }

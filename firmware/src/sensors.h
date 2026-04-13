@@ -1,3 +1,8 @@
+/**
+ * SmartSoil v2 - Sensor-Modul
+ * Kapazitive Feuchtesensoren mit Kalibrierung und Trend-Erkennung
+ */
+
 #ifndef SENSORS_H
 #define SENSORS_H
 
@@ -5,119 +10,219 @@
 #include <EEPROM.h>
 #include "config.h"
 
-struct SensorData {
-    float moisturePercent;
-    float moistureRaw;
-    float phValue;
-    float phVoltage;
-    float batteryVoltage;
-    int   batteryPercent;
+// Feuchte-Status Kategorien
+enum MoistureStatus {
+    STATUS_CRITICAL_DRY,   // < 15% - Pflanze in Not!
+    STATUS_DRY,            // 15-30% - Giessen!
+    STATUS_OK,             // 30-65% - Perfekt
+    STATUS_WET,            // 65-80% - Etwas viel
+    STATUS_FLOODED         // > 80% - Zu nass
 };
 
-class Sensors {
+// Trend über die letzten Messungen
+enum MoistureTrend {
+    TREND_FALLING_FAST,   // Trocknet schnell
+    TREND_FALLING,        // Trocknet langsam
+    TREND_STABLE,         // Stabil
+    TREND_RISING,         // Wird feuchter
+};
+
+struct PlantReading {
+    uint8_t  sensorIndex;
+    float    moisturePercent;      // 0-100%
+    int      rawADC;               // Rohwert für Debugging
+    MoistureStatus status;
+    MoistureTrend  trend;
+    unsigned long  timestamp;      // millis() der letzten Messung
+    float    history[HISTORY_SIZE]; // Verlaufsdaten
+    uint8_t  historyCount;         // Wie viele Werte gespeichert
+    uint8_t  historyIndex;         // Ringpuffer-Zeiger
+    bool     valid;                // Sensor angeschlossen und misst sinnvoll?
+};
+
+class SensorManager {
 public:
-    // Kalibrierungswerte (im RAM, aus EEPROM geladen)
-    float phCal4V = PH_CAL_DEFAULT_4;
-    float phCal7V = PH_CAL_DEFAULT_7;
-    int   moistDry = MOISTURE_DRY;
-    int   moistWet = MOISTURE_WET;
+    PlantReading plants[5];   // Max 5 Sensoren
+
+    // Kalibrierungswerte pro Sensor
+    int calDry[5];
+    int calWet[5];
 
     void begin() {
-        analogReadResolution(12);
-        analogSetAttenuation(ADC_11db);
-        loadCalibration();
+        analogReadResolution(12);       // 12-bit ADC: 0-4095
+        analogSetAttenuation(ADC_11db); // Messbereich 0-3.3V
+
+        // Kalibrierung laden oder Defaults setzen
+        EEPROM.begin(EEPROM_SIZE);
+        if (EEPROM.read(EEPROM_ADDR_MAGIC) == EEPROM_MAGIC_BYTE) {
+            loadCalibration();
+            Serial.println("[Sensoren] Kalibrierung aus EEPROM geladen");
+        } else {
+            for (int i = 0; i < 5; i++) {
+                calDry[i] = CAL_DRY_DEFAULT;
+                calWet[i] = CAL_WET_DEFAULT;
+            }
+            Serial.println("[Sensoren] Standard-Kalibrierung aktiv");
+        }
+
+        // PlantReading initialisieren
+        for (int i = 0; i < NUM_SENSORS; i++) {
+            plants[i].sensorIndex = i;
+            plants[i].moisturePercent = 0;
+            plants[i].rawADC = 0;
+            plants[i].status = STATUS_DRY;
+            plants[i].trend = TREND_STABLE;
+            plants[i].timestamp = 0;
+            plants[i].historyCount = 0;
+            plants[i].historyIndex = 0;
+            plants[i].valid = true;
+            for (int j = 0; j < HISTORY_SIZE; j++) plants[i].history[j] = 0;
+        }
     }
 
-    SensorData read() {
-        SensorData data;
-
-        // Feuchte
-        data.moistureRaw = readMedian(PIN_MOISTURE, MOISTURE_SAMPLES);
-        data.moisturePercent = mapFloat(data.moistureRaw, moistDry, moistWet, 0.0, 100.0);
-        data.moisturePercent = constrain(data.moisturePercent, 0.0f, 100.0f);
-
-        // pH
-        float phRaw = readMedian(PIN_PH, PH_SAMPLES);
-        data.phVoltage = phRaw * (3.3 / 4095.0);
-        // Lineare Interpolation zwischen den 2 Kalibrierpunkten
-        float slope = (7.0 - 4.0) / (phCal7V - phCal4V);
-        data.phValue = 7.0 + slope * (data.phVoltage - phCal7V);
-        data.phValue = constrain(data.phValue, 0.0f, 14.0f);
-
-        // Batterie
-        float batRaw = readMedian(PIN_BATTERY, 10);
-        data.batteryVoltage = (batRaw * 3.3 / 4095.0) * BATTERY_DIVIDER;
-        data.batteryPercent = (int)mapFloat(data.batteryVoltage,
-                                            BATTERY_EMPTY, BATTERY_FULL, 0.0, 100.0);
-        data.batteryPercent = constrain(data.batteryPercent, 0, 100);
-
-        return data;
+    // Alle Sensoren lesen
+    void readAll() {
+        for (int i = 0; i < NUM_SENSORS; i++) {
+            readSensor(i);
+        }
     }
 
-    // Kalibrierung pH: aktuelle Spannung für Puffer speichern
-    void calibratePH4(float voltage) { phCal4V = voltage; }
-    void calibratePH7(float voltage) { phCal7V = voltage; }
+    // Einen Sensor lesen
+    void readSensor(int idx) {
+        if (idx >= NUM_SENSORS) return;
 
-    // Kalibrierung Feuchte
-    void calibrateMoistureDry(int raw) { moistDry = raw; }
-    void calibrateMoistureWet(int raw) { moistWet = raw; }
+        int raw = readMedian(SENSOR_PINS[idx], SAMPLES_PER_READING);
+        float pct = rawToPercent(raw, calDry[idx], calWet[idx]);
 
-    float readPHVoltage() {
-        float raw = readMedian(PIN_PH, PH_SAMPLES);
-        return raw * (3.3 / 4095.0);
+        // Plausibilitätsprüfung
+        // Wenn ADC = 0 oder 4095 → Sensor vermutlich nicht angeschlossen
+        plants[idx].valid = (raw > 50 && raw < 4050);
+        plants[idx].rawADC = raw;
+        plants[idx].moisturePercent = pct;
+        plants[idx].status = calcStatus(pct);
+        plants[idx].timestamp = millis();
+
+        // Verlaufspuffer aktualisieren (Ringpuffer)
+        plants[idx].history[plants[idx].historyIndex] = pct;
+        plants[idx].historyIndex = (plants[idx].historyIndex + 1) % HISTORY_SIZE;
+        if (plants[idx].historyCount < HISTORY_SIZE) plants[idx].historyCount++;
+
+        // Trend berechnen
+        plants[idx].trend = calcTrend(idx);
     }
 
-    int readMoistureRaw() {
-        return (int)readMedian(PIN_MOISTURE, MOISTURE_SAMPLES);
+    // Kalibrierung: aktuellen Wert als "trocken" speichern
+    void calibrateDry(int idx) {
+        calDry[idx] = readMedian(SENSOR_PINS[idx], SAMPLES_PER_READING);
+        Serial.printf("[Cal] Sensor %d trocken: %d\n", idx, calDry[idx]);
+    }
+
+    // Kalibrierung: aktuellen Wert als "nass" speichern
+    void calibrateWet(int idx) {
+        calWet[idx] = readMedian(SENSOR_PINS[idx], SAMPLES_PER_READING);
+        Serial.printf("[Cal] Sensor %d nass: %d\n", idx, calWet[idx]);
     }
 
     void saveCalibration() {
-        EEPROM.write(EEPROM_ADDR_MAGIC, EEPROM_MAGIC);
-        EEPROM.put(EEPROM_ADDR_PH_4V, phCal4V);
-        EEPROM.put(EEPROM_ADDR_PH_7V, phCal7V);
-        EEPROM.put(EEPROM_ADDR_MOIST_D, moistDry);
-        EEPROM.put(EEPROM_ADDR_MOIST_W, moistWet);
+        EEPROM.write(EEPROM_ADDR_MAGIC, EEPROM_MAGIC_BYTE);
+        for (int i = 0; i < 5; i++) {
+            int offset = EEPROM_CAL_BASE + i * 8;
+            EEPROM.put(offset, calDry[i]);
+            EEPROM.put(offset + 4, calWet[i]);
+        }
         EEPROM.commit();
+        Serial.println("[Cal] Kalibrierung gespeichert");
     }
 
-    void loadCalibration() {
-        EEPROM.begin(EEPROM_SIZE);
-        if (EEPROM.read(EEPROM_ADDR_MAGIC) == EEPROM_MAGIC) {
-            EEPROM.get(EEPROM_ADDR_PH_4V, phCal4V);
-            EEPROM.get(EEPROM_ADDR_PH_7V, phCal7V);
-            EEPROM.get(EEPROM_ADDR_MOIST_D, moistDry);
-            EEPROM.get(EEPROM_ADDR_MOIST_W, moistWet);
-            Serial.println("Kalibrierung aus EEPROM geladen.");
-        } else {
-            Serial.println("Keine Kalibrierung gefunden, Defaults aktiv.");
+    const char* statusText(MoistureStatus s) {
+        switch(s) {
+            case STATUS_CRITICAL_DRY: return "KRITISCH TROCKEN";
+            case STATUS_DRY:          return "Giessen!";
+            case STATUS_OK:           return "Optimal";
+            case STATUS_WET:          return "Feucht";
+            case STATUS_FLOODED:      return "Zu nass!";
         }
+        return "?";
+    }
+
+    const char* trendSymbol(MoistureTrend t) {
+        switch(t) {
+            case TREND_FALLING_FAST: return "↓↓";
+            case TREND_FALLING:      return "↓";
+            case TREND_STABLE:       return "→";
+            case TREND_RISING:       return "↑";
+        }
+        return "~";
     }
 
 private:
-    // Median-Filter: sortiert N Messungen und nimmt den mittleren Wert
-    // Robuster als Mittelwert (Ausreißer werden ignoriert)
-    float readMedian(int pin, int samples) {
-        int values[samples];
-        for (int i = 0; i < samples; i++) {
-            values[i] = analogRead(pin);
-            delay(2);
+    void loadCalibration() {
+        for (int i = 0; i < 5; i++) {
+            int offset = EEPROM_CAL_BASE + i * 8;
+            EEPROM.get(offset, calDry[i]);
+            EEPROM.get(offset + 4, calWet[i]);
+            // Sanity check
+            if (calDry[i] < 1000 || calDry[i] > 4095) calDry[i] = CAL_DRY_DEFAULT;
+            if (calWet[i] < 100  || calWet[i] > 3000)  calWet[i] = CAL_WET_DEFAULT;
         }
-        // Einfacher Bubblesort (kleine Arrays)
-        for (int i = 0; i < samples - 1; i++) {
-            for (int j = i + 1; j < samples; j++) {
-                if (values[j] < values[i]) {
-                    int tmp = values[i];
-                    values[i] = values[j];
-                    values[j] = tmp;
-                }
-            }
-        }
-        return values[samples / 2];
     }
 
-    float mapFloat(float x, float inMin, float inMax, float outMin, float outMax) {
-        return (x - inMin) * (outMax - outMin) / (inMax - inMin) + outMin;
+    // Median-Filter: sortiert N Messungen, nimmt den mittleren Wert
+    // Ignoriert Ausreißer deutlich besser als Mittelwert
+    int readMedian(uint8_t pin, int n) {
+        int* vals = new int[n];
+        for (int i = 0; i < n; i++) {
+            vals[i] = analogRead(pin);
+            delayMicroseconds(500);
+        }
+        // Insertion-Sort (für kleine Arrays effizient)
+        for (int i = 1; i < n; i++) {
+            int key = vals[i];
+            int j = i - 1;
+            while (j >= 0 && vals[j] > key) {
+                vals[j + 1] = vals[j];
+                j--;
+            }
+            vals[j + 1] = key;
+        }
+        int result = vals[n / 2];
+        delete[] vals;
+        return result;
+    }
+
+    float rawToPercent(int raw, int dry, int wet) {
+        // Invertiert: hoher ADC = trocken, niedriger ADC = nass
+        float pct = (float)(dry - raw) / (float)(dry - wet) * 100.0f;
+        return constrain(pct, 0.0f, 100.0f);
+    }
+
+    MoistureStatus calcStatus(float pct) {
+        if (pct < THRESH_CRITICAL_DRY) return STATUS_CRITICAL_DRY;
+        if (pct < THRESH_DRY)          return STATUS_DRY;
+        if (pct < THRESH_OK_HIGH)      return STATUS_OK;
+        if (pct < THRESH_WET)          return STATUS_WET;
+        return STATUS_FLOODED;
+    }
+
+    MoistureTrend calcTrend(int idx) {
+        int count = plants[idx].historyCount;
+        if (count < 3) return TREND_STABLE;
+
+        // Letzten 6 Werte (oder weniger wenn nicht genug da) vergleichen
+        int lookback = min(count, 6);
+        // Rückwärts durch Ringpuffer lesen
+        int latestIdx  = ((int)plants[idx].historyIndex - 1 + HISTORY_SIZE) % HISTORY_SIZE;
+        int oldestIdx  = ((int)plants[idx].historyIndex - lookback + HISTORY_SIZE) % HISTORY_SIZE;
+
+        float latest = plants[idx].history[latestIdx];
+        float oldest = plants[idx].history[oldestIdx];
+        float delta  = latest - oldest;  // Positiv = wird feuchter, Negativ = trocknet
+
+        if (delta < -8.0f)  return TREND_FALLING_FAST;
+        if (delta < -2.0f)  return TREND_FALLING;
+        if (delta >  2.0f)  return TREND_RISING;
+        return TREND_STABLE;
     }
 };
 
-#endif
+#endif // SENSORS_H
